@@ -3,20 +3,18 @@ FastAPI backend + CLI entry point for Human vs AI Text Classification.
 
 Pipeline:
     text
-      -> tokenizer_cl.pkl
-      -> padded sequence (MAX_LEN tokens)
-      -> bgru_model_new.keras
+      -> TF-IDF vectorizer
+      -> Logistic Regression
       -> Human / AI probability
 
-extract_text_features() is retained only for displaying / explainability
-information on the frontend. It is NOT used as input to the BGru neural
-network.
+Model:
+    ai_vs_human_model_LR50k.pkl
 
 Usage:
-    Run as an API server (default):
+    Run API:
         python app.py
 
-    Run a quick CLI smoke test against sample texts instead:
+    CLI test:
         python app.py test
 """
 
@@ -27,29 +25,34 @@ from typing import Optional, Any
 
 import numpy as np
 import pandas as pd
-import tensorflow as tf
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from tensorflow.keras.preprocessing.sequence import pad_sequences
-
 from text_feature_extractor import extract_text_features
 
 
+# --------------------------------------------------------------------------
+# Paths
+# --------------------------------------------------------------------------
+
 BASE_DIR = Path(__file__).resolve().parent
-MODEL_PATH = BASE_DIR / "bgru_model_new.keras"
-TOKENIZER_PATH = BASE_DIR / "tokenizer_cl.pkl"
 
-# Exact preprocessing used during BGru training.
-MAX_LEN = 842
-PADDING = "post"
-TRUNCATING = "post"
+MODEL_PATH = BASE_DIR / "ai_vs_human_model_LR50k.pkl"
 
-# Model was trained with a sigmoid output for binary classification.
-AI_CLASS_INDEX = 1
-HUMAN_CLASS_INDEX = 0
+
+# --------------------------------------------------------------------------
+# Classification configuration
+# --------------------------------------------------------------------------
+
+# IMPORTANT:
+# Change these only if your training labels are reversed.
+#
+# 0 = Human
+# 1 = AI
+HUMAN_CLASS = 0
+AI_CLASS = 1
 
 
 # --------------------------------------------------------------------------
@@ -58,8 +61,11 @@ HUMAN_CLASS_INDEX = 0
 
 app = FastAPI(
     title="Human vs AI Text Classifier",
-    description="Classify text with a trained Bidirectional GRU and expose extracted text features.",
-    version="2.0.0",
+    description=(
+        "Human vs AI text classification using "
+        "TF-IDF and Logistic Regression."
+    ),
+    version="3.0.0",
 )
 
 app.add_middleware(
@@ -71,17 +77,16 @@ app.add_middleware(
 )
 
 
+# --------------------------------------------------------------------------
+# Pydantic models
+# --------------------------------------------------------------------------
+
 class TextInput(BaseModel):
-    text: str = Field(..., min_length=1, description="Text to classify")
-
-
-class PredictionResult(BaseModel):
-    input_text: str
-    prediction: str
-    confidence: Optional[float] = None
-    features_extracted: int
-    model_used: str = "bgru_model_new.keras"
-    tokenizer_used: str = "tokenizer_cl.pkl"
+    text: str = Field(
+        ...,
+        min_length=1,
+        description="Text to classify",
+    )
 
 
 class PredictResponse(BaseModel):
@@ -93,25 +98,48 @@ class PredictResponse(BaseModel):
     features: dict
 
 
+class PredictionResult(BaseModel):
+    input_text: str
+    prediction: str
+    confidence: Optional[float] = None
+    features_extracted: int
+    model_used: str = "ai_vs_human_model_LR50k.pkl"
+
+
 class HealthResponse(BaseModel):
     status: str
     model_loaded: bool
-    tokenizer_loaded: bool
     model_path: str
-    tokenizer_path: str
-    max_len: int
-
-
-_model: Optional[Any] = None
-_tokenizer: Optional[Any] = None
 
 
 # --------------------------------------------------------------------------
-# Model / tokenizer loading
+# Global model
+# --------------------------------------------------------------------------
+
+_model: Optional[Any] = None
+
+
+# --------------------------------------------------------------------------
+# Model loading
 # --------------------------------------------------------------------------
 
 def load_model():
-    """Load bgru_model_new.keras once and cache it."""
+    """
+    Load the TF-IDF + Logistic Regression model once.
+
+    The pickle can contain either:
+
+        1. A complete sklearn Pipeline
+
+    or:
+
+        2. A dictionary containing vectorizer + classifier
+
+    or:
+
+        3. A classifier that already expects TF-IDF vectors.
+    """
+
     global _model
 
     if _model is not None:
@@ -119,129 +147,205 @@ def load_model():
 
     if not MODEL_PATH.exists():
         raise FileNotFoundError(
-            f"Model file not found: {MODEL_PATH}. "
-            "Place bgru_model_new.keras in the same directory as app.py."
+            f"Model file not found: {MODEL_PATH}"
         )
 
     try:
-        _model = tf.keras.models.load_model(MODEL_PATH, compile=False)
-        print(f"BGru model loaded: {MODEL_PATH}")
-        print(f"Model input shape: {_model.input_shape}")
-        print(f"Model output shape: {_model.output_shape}")
+        with open(MODEL_PATH, "rb") as f:
+            _model = pickle.load(f)
+
+        print(f"Model loaded: {MODEL_PATH}")
+        print(f"Model type: {type(_model)}")
+
         return _model
+
     except Exception as e:
-        raise RuntimeError(f"Failed to load bgru_model_new.keras: {e}")
-
-
-def load_tokenizer():
-    """Load the tokenizer used during model training, once, and cache it."""
-    global _tokenizer
-
-    if _tokenizer is not None:
-        return _tokenizer
-
-    if not TOKENIZER_PATH.exists():
-        raise FileNotFoundError(
-            f"Tokenizer file not found: {TOKENIZER_PATH}. "
-            "Place tokenizer_cl.pkl in the same directory as app.py."
+        raise RuntimeError(
+            f"Failed to load {MODEL_PATH}: {e}"
         )
-
-    try:
-        with open(TOKENIZER_PATH, "rb") as f:
-            _tokenizer = pickle.load(f)
-
-        print(f"Tokenizer loaded: {TOKENIZER_PATH}")
-        print(f"Tokenizer vocabulary size: {len(_tokenizer.word_index)}")
-        return _tokenizer
-    except Exception as e:
-        raise RuntimeError(f"Failed to load tokenizer_cl.pkl: {e}")
 
 
 def get_model():
     return _model if _model is not None else load_model()
 
 
-def get_tokenizer():
-    return _tokenizer if _tokenizer is not None else load_tokenizer()
-
-
 # --------------------------------------------------------------------------
-# Inference helpers
+# Prediction
 # --------------------------------------------------------------------------
 
-def tokenize_text(text: str, tokenizer=None) -> np.ndarray:
+def predict_text(text: str, model=None):
     """
-    Convert raw text into the exact kind of integer sequence expected by
-    the Embedding layer.
+    Run TF-IDF + Logistic Regression prediction.
 
-    IMPORTANT:
-    padding/truncation must match the preprocessing used during training.
-    This currently uses post-padding and post-truncation.
+    Supports:
+        sklearn Pipeline
+        vectorizer/classifier dictionary
+        classifier with pre-vectorized input
     """
-    if tokenizer is None:
-        tokenizer = get_tokenizer()
 
-    sequences = tokenizer.texts_to_sequences([text])
-
-    padded = pad_sequences(
-        sequences,
-        maxlen=MAX_LEN,
-        padding=PADDING,
-        truncating=TRUNCATING,
-        dtype="int32",
-    )
-
-    return padded
-
-
-def predict_with_bgru(text: str, model=None, tokenizer=None):
-    """Run tokenizer -> padding -> BGru model."""
     if model is None:
         model = get_model()
 
-    tokenized = tokenize_text(text, tokenizer=tokenizer)
+    # --------------------------------------------------------------
+    # Case 1:
+    # Complete sklearn Pipeline
+    # --------------------------------------------------------------
 
-    raw_output = model.predict(tokenized, verbose=0)
-    ai_probability = float(np.asarray(raw_output).reshape(-1)[0])
+    if hasattr(model, "predict_proba") and hasattr(model, "predict"):
 
-    # Sigmoid output = probability of class 1 (AI).
-    ai_probability = float(np.clip(ai_probability, 0.0, 1.0))
-    human_probability = 1.0 - ai_probability
+        # Pipeline can directly accept raw text.
+        try:
+            prediction_raw = model.predict([text])
+            probabilities = model.predict_proba([text])
 
-    prediction = 1 if ai_probability >= 0.5 else 0
-    label = "AI" if prediction == AI_CLASS_INDEX else "Human"
+            prediction = int(prediction_raw[0])
 
-    return prediction, label, ai_probability, human_probability
+            probabilities = np.asarray(probabilities)[0]
+
+            # Find probability belonging to class 1.
+            if hasattr(model, "classes_"):
+                classes = list(model.classes_)
+
+                if AI_CLASS in classes:
+                    ai_index = classes.index(AI_CLASS)
+                    ai_probability = float(probabilities[ai_index])
+                else:
+                    ai_probability = float(probabilities[-1])
+            else:
+                ai_probability = float(probabilities[-1])
+
+            human_probability = 1.0 - ai_probability
+
+            label = (
+                "AI"
+                if prediction == AI_CLASS
+                else "Human"
+            )
+
+            return (
+                prediction,
+                label,
+                ai_probability,
+                human_probability,
+            )
+
+        except Exception:
+            pass
+
+    # --------------------------------------------------------------
+    # Case 2:
+    # Dictionary containing vectorizer + classifier
+    # --------------------------------------------------------------
+
+    if isinstance(model, dict):
+
+        vectorizer = (
+            model.get("vectorizer")
+            or model.get("tfidf")
+            or model.get("tfidf_vectorizer")
+        )
+
+        classifier = (
+            model.get("model")
+            or model.get("classifier")
+            or model.get("lr")
+            or model.get("logistic_regression")
+        )
+
+        if vectorizer is None or classifier is None:
+            raise RuntimeError(
+                "Dictionary model does not contain a recognizable "
+                "TF-IDF vectorizer and classifier."
+            )
+
+        X = vectorizer.transform([text])
+
+        prediction = int(classifier.predict(X)[0])
+
+        probabilities = classifier.predict_proba(X)[0]
+
+        if hasattr(classifier, "classes_"):
+            classes = list(classifier.classes_)
+
+            if AI_CLASS in classes:
+                ai_index = classes.index(AI_CLASS)
+                ai_probability = float(probabilities[ai_index])
+            else:
+                ai_probability = float(probabilities[-1])
+        else:
+            ai_probability = float(probabilities[-1])
+
+        human_probability = 1.0 - ai_probability
+
+        label = (
+            "AI"
+            if prediction == AI_CLASS
+            else "Human"
+        )
+
+        return (
+            prediction,
+            label,
+            ai_probability,
+            human_probability,
+        )
+
+    raise RuntimeError(
+        "Unsupported model format. The pickle must contain either "
+        "an sklearn Pipeline or a vectorizer/classifier pair."
+    )
 
 
-def _confidence_bucket(max_probability: float) -> str:
+# --------------------------------------------------------------------------
+# Confidence
+# --------------------------------------------------------------------------
+
+def confidence_bucket(max_probability: float) -> str:
+
     if max_probability >= 0.85:
         return "High"
+
     if max_probability >= 0.65:
         return "Medium"
+
     return "Low"
 
 
-def _json_safe(value):
-    """Convert numpy/pandas scalar values into JSON-compatible values."""
-    if isinstance(value, (np.integer,)):
+# --------------------------------------------------------------------------
+# JSON conversion
+# --------------------------------------------------------------------------
+
+def json_safe(value):
+
+    if isinstance(value, np.integer):
         return int(value)
-    if isinstance(value, (np.floating,)):
+
+    if isinstance(value, np.floating):
         return float(value)
-    if isinstance(value, (np.bool_,)):
+
+    if isinstance(value, np.bool_):
         return bool(value)
+
     if pd.isna(value):
         return None
+
     return value
 
 
+# --------------------------------------------------------------------------
+# Frontend features
+# --------------------------------------------------------------------------
+
 def get_frontend_features(text: str) -> dict:
     """
-    Keep extract_text_features() for frontend information.
+    Extract deterministic text features for frontend display.
 
-    These features are NOT fed into bgru_model_new.keras. The BGru model
-    receives only the tokenizer/padded token sequence.
+    IMPORTANT:
+
+    These features are NOT used by the Logistic Regression model
+    unless your original training pipeline explicitly used them.
     """
+
     features_df = extract_text_features(text)
 
     if features_df.empty:
@@ -249,21 +353,33 @@ def get_frontend_features(text: str) -> dict:
 
     features = features_df.iloc[0].to_dict()
 
-    # Raw text is already returned separately and is not useful as a feature.
     features.pop("Raw_Text", None)
 
-    return {str(k): _json_safe(v) for k, v in features.items()}
+    return {
+        str(k): json_safe(v)
+        for k, v in features.items()
+    }
 
 
-def classify_text(text: str, model=None, tokenizer=None) -> dict:
-    """
-    High-level convenience wrapper used by both the CLI test runner and
-    (indirectly, via predict_with_bgru/get_frontend_features) the API
-    endpoints below. Runs the full pipeline and returns a single dict.
-    """
-    prediction, label, ai_probability, human_probability = predict_with_bgru(
-        text, model=model, tokenizer=tokenizer
+# --------------------------------------------------------------------------
+# High-level classification
+# --------------------------------------------------------------------------
+
+def classify_text(
+    text: str,
+    model=None,
+):
+
+    (
+        prediction,
+        label,
+        ai_probability,
+        human_probability,
+    ) = predict_text(
+        text,
+        model=model,
     )
+
     features = get_frontend_features(text)
 
     return {
@@ -272,81 +388,92 @@ def classify_text(text: str, model=None, tokenizer=None) -> dict:
         "label": label,
         "ai_probability": ai_probability,
         "human_probability": human_probability,
-        "confidence": max(ai_probability, human_probability),
+        "confidence": max(
+            ai_probability,
+            human_probability,
+        ),
         "features": features,
     }
 
 
 # --------------------------------------------------------------------------
-# FastAPI lifecycle
+# Startup
 # --------------------------------------------------------------------------
 
 @app.on_event("startup")
 async def startup_event():
+
     try:
         load_model()
-        load_tokenizer()
+
     except Exception as e:
-        # Do not prevent FastAPI from starting; /health will report the issue.
-        print(f"Warning: startup loading failed: {e}")
+        print(
+            f"Warning: model loading failed: {e}"
+        )
 
 
 # --------------------------------------------------------------------------
-# Endpoints
+# Health
 # --------------------------------------------------------------------------
 
-@app.get("/health", response_model=HealthResponse)
+@app.get(
+    "/health",
+    response_model=HealthResponse,
+)
 async def health_check():
+
     model_loaded = False
-    tokenizer_loaded = False
 
     try:
         load_model()
         model_loaded = True
+
     except Exception:
         pass
-
-    try:
-        load_tokenizer()
-        tokenizer_loaded = True
-    except Exception:
-        pass
-
-    healthy = model_loaded and tokenizer_loaded
 
     return HealthResponse(
-        status="healthy" if healthy else "model_or_tokenizer_not_loaded",
+        status=(
+            "healthy"
+            if model_loaded
+            else "model_not_loaded"
+        ),
         model_loaded=model_loaded,
-        tokenizer_loaded=tokenizer_loaded,
         model_path=str(MODEL_PATH),
-        tokenizer_path=str(TOKENIZER_PATH),
-        max_len=MAX_LEN,
     )
 
 
-@app.post("/predict", response_model=PredictResponse)
-async def predict_text(input_data: TextInput):
-    """
-    Main endpoint for the frontend.
+# --------------------------------------------------------------------------
+# Main prediction endpoint
+# --------------------------------------------------------------------------
 
-    Pipeline:
-        raw text
-          -> tokenizer_cl.pkl
-          -> padded integer sequence (MAX_LEN tokens)
-          -> bgru_model_new.keras
-          -> AI/Human probabilities
+@app.post(
+    "/predict",
+    response_model=PredictResponse,
+)
+async def predict_text_endpoint(
+    input_data: TextInput,
+):
 
-    extract_text_features() is kept separately for frontend information.
-    """
     try:
-        prediction, label, ai_probability, human_probability = predict_with_bgru(
+
+        (
+            prediction,
+            label,
+            ai_probability,
+            human_probability,
+        ) = predict_text(
             input_data.text
         )
 
-        features = get_frontend_features(input_data.text)
+        features = get_frontend_features(
+            input_data.text
+        )
 
-        confidence = _confidence_bucket(
-            max(ai_probability, human_probability)
+        confidence = confidence_bucket(
+            max(
+                ai_probability,
+                human_probability,
+            )
         )
 
         return PredictResponse(
@@ -359,23 +486,46 @@ async def predict_text(input_data: TextInput):
         )
 
     except FileNotFoundError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+
+        raise HTTPException(
+            status_code=503,
+            detail=str(e),
+        )
+
     except Exception as e:
+
         raise HTTPException(
             status_code=500,
             detail=f"Prediction error: {e}",
         )
 
 
-@app.post("/classify", response_model=PredictionResult)
-async def classify_text_endpoint(input_data: TextInput):
-    """Backward-compatible endpoint with the simpler response format."""
+# --------------------------------------------------------------------------
+# Backward-compatible endpoint
+# --------------------------------------------------------------------------
+
+@app.post(
+    "/classify",
+    response_model=PredictionResult,
+)
+async def classify_text_endpoint(
+    input_data: TextInput,
+):
+
     try:
-        prediction, label, ai_probability, human_probability = predict_with_bgru(
+
+        (
+            prediction,
+            label,
+            ai_probability,
+            human_probability,
+        ) = predict_text(
             input_data.text
         )
 
-        features = get_frontend_features(input_data.text)
+        features = get_frontend_features(
+            input_data.text
+        )
 
         return PredictionResult(
             input_text=(
@@ -384,28 +534,42 @@ async def classify_text_endpoint(input_data: TextInput):
                 else input_data.text
             ),
             prediction=label,
-            confidence=max(ai_probability, human_probability),
+            confidence=max(
+                ai_probability,
+                human_probability,
+            ),
             features_extracted=len(features),
         )
 
     except FileNotFoundError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+
+        raise HTTPException(
+            status_code=503,
+            detail=str(e),
+        )
+
     except Exception as e:
+
         raise HTTPException(
             status_code=500,
             detail=f"Classification error: {e}",
         )
 
 
-@app.post("/features")
-async def extract_features(input_data: TextInput):
-    """
-    Extract deterministic text features for frontend display/debugging.
+# --------------------------------------------------------------------------
+# Features endpoint
+# --------------------------------------------------------------------------
 
-    This endpoint does not run the BGru model.
-    """
+@app.post("/features")
+async def extract_features_endpoint(
+    input_data: TextInput,
+):
+
     try:
-        features = get_frontend_features(input_data.text)
+
+        features = get_frontend_features(
+            input_data.text
+        )
 
         return {
             "text": (
@@ -417,66 +581,133 @@ async def extract_features(input_data: TextInput):
         }
 
     except Exception as e:
+
         raise HTTPException(
             status_code=500,
             detail=f"Feature extraction error: {e}",
         )
 
 
+# --------------------------------------------------------------------------
+# Root endpoint
+# --------------------------------------------------------------------------
+
 @app.get("/")
 async def root():
+
     return {
         "message": "Human vs AI Text Classification API",
-        "model": "bgru_model_new.keras",
-        "tokenizer": "tokenizer_cl.pkl",
-        "max_sequence_length": MAX_LEN,
+
+        "model": (
+            "ai_vs_human_model_LR50k.pkl"
+        ),
+
+        "classifier": (
+            "TF-IDF + Logistic Regression"
+        ),
+
         "endpoints": {
-            "POST /predict": "Run BGru prediction and return frontend text features",
-            "POST /classify": "Run BGru prediction with a simpler response",
-            "POST /features": "Extract frontend information without prediction",
-            "GET /health": "Check model/tokenizer loading",
-            "GET /docs": "Interactive API documentation",
+
+            "POST /predict":
+                "Run Logistic Regression prediction "
+                "and return frontend features",
+
+            "POST /classify":
+                "Run prediction with simpler response",
+
+            "POST /features":
+                "Extract frontend features without prediction",
+
+            "GET /health":
+                "Check model loading",
+
+            "GET /docs":
+                "Interactive API documentation",
         },
     }
 
 
 # --------------------------------------------------------------------------
-# CLI smoke test (replaces standalone main.py)
+# CLI smoke test
 # --------------------------------------------------------------------------
 
 def run_cli_test():
-    """Quick sanity check against a couple of sample texts, no server needed."""
+
     model = load_model()
-    tokenizer = load_tokenizer()
 
     sample_texts = [
-        "I love programming in Python. It's fun and powerful.",
+
+        "I love programming in Python. "
+        "It's fun and powerful.",
+
         (
-            "The implementation of machine learning algorithms requires careful "
-            "consideration of computational complexity and data preprocessing "
-            "strategies to ensure optimal model performance."
+            "The implementation of machine learning "
+            "algorithms requires careful consideration "
+            "of computational complexity and data "
+            "preprocessing strategies to ensure "
+            "optimal model performance."
         ),
+
     ]
 
-    print("Testing BGru Text Classification\n" + "=" * 60)
+    print(
+        "Testing TF-IDF + Logistic Regression"
+        "\n" + "=" * 60
+    )
 
     for text in sample_texts:
-        result = classify_text(text, model=model, tokenizer=tokenizer)
 
-        print(f"\nText: {result['text'][:100]}...")
-        print(f"Prediction: {result['label']}")
-        print(f"AI probability: {result['ai_probability']:.4f}")
-        print(f"Human probability: {result['human_probability']:.4f}")
-        print(f"Confidence: {result['confidence']:.4f}")
-        print(f"Frontend features extracted: {len(result['features'])}")
+        result = classify_text(
+            text,
+            model=model,
+        )
 
+        print(
+            f"\nText: {result['text'][:100]}..."
+        )
+
+        print(
+            f"Prediction: {result['label']}"
+        )
+
+        print(
+            f"AI probability: "
+            f"{result['ai_probability']:.4f}"
+        )
+
+        print(
+            f"Human probability: "
+            f"{result['human_probability']:.4f}"
+        )
+
+        print(
+            f"Confidence: "
+            f"{result['confidence']:.4f}"
+        )
+
+        print(
+            "Frontend features extracted: "
+            f"{len(result['features'])}"
+        )
+
+
+# --------------------------------------------------------------------------
+# Entry point
+# --------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "test":
+
+    if (
+        len(sys.argv) > 1
+        and sys.argv[1] == "test"
+    ):
+
         # python app.py test
         run_cli_test()
+
     else:
-        # python app.py  -> start the API server
+
+        # python app.py
         import uvicorn
 
         uvicorn.run(
