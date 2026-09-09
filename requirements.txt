@@ -3,4 +3,3 @@ uvicorn[standard]
 pandas
 numpy
 scikit-learn
-tensorflow
