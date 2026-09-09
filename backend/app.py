@@ -1,31 +1,37 @@
 """
-FastAPI backend + CLI entry point for Human vs AI Text Classification.
+FastAPI backend for Human vs AI Text Classification
 
-Pipeline:
-    text
-      -> TF-IDF vectorizer
-      -> Logistic Regression
-      -> Human / AI probability
+Flow:
+1. Accept text input from user
+2. Extract features using text_feature_extractor.py -> produces a DataFrame
+   used ONLY for the frontend's stats display (word count, char count, etc.)
+   -- it plays no role in the model's prediction.
+3. Load ai_vs_human_model_LR50k.pkl -- a sklearn Pipeline:
+     Pipeline([
+         ('preprocessor', ColumnTransformer([('text', TfidfVectorizer(), 'text')])),
+         ('classifier', LogisticRegression()),
+     ])
+   The ColumnTransformer selects a column literally named "text", so the
+   pipeline must be called with a pandas DataFrame shaped like
+   pd.DataFrame({'text': [input_text]}) -- not a bare string, and not a
+   list of strings.
+4. Return classification result
 
-Model:
-    ai_vs_human_model_LR50k.pkl
-
-Usage:
-    Run API:
-        python app.py
-
-    CLI test:
-        python app.py test
+IMPORTANT: this model must be loaded with joblib.load(), not pickle.load().
+scikit-learn Pipelines with large numpy arrays (TF-IDF vocab, coefficients)
+are commonly saved via joblib.dump(), which stores big arrays outside the
+main pickle opcode stream. Calling plain pickle.load() on such a file causes
+the unpickler to desync partway through and fail with
+`UnpicklingError: STACK_GLOBAL requires str` -- this is NOT a scikit-learn
+version mismatch, it's the wrong loader function.
 """
 
-import pickle
-import sys
+import warnings
 from pathlib import Path
-from typing import Optional, Any
+from typing import Optional
 
-import numpy as np
+import joblib
 import pandas as pd
-
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -33,41 +39,14 @@ from pydantic import BaseModel, Field
 from text_feature_extractor import extract_text_features
 
 
-# --------------------------------------------------------------------------
-# Paths
-# --------------------------------------------------------------------------
-
-BASE_DIR = Path(__file__).resolve().parent
-
-MODEL_PATH = BASE_DIR / "ai_vs_human_model_LR50k.pkl"
-
-
-# --------------------------------------------------------------------------
-# Classification configuration
-# --------------------------------------------------------------------------
-
-# IMPORTANT:
-# Change these only if your training labels are reversed.
-#
-# 0 = Human
-# 1 = AI
-HUMAN_CLASS = 0
-AI_CLASS = 1
-
-
-# --------------------------------------------------------------------------
-# FastAPI app
-# --------------------------------------------------------------------------
-
+# Initialize FastAPI app
 app = FastAPI(
     title="Human vs AI Text Classifier",
-    description=(
-        "Human vs AI text classification using "
-        "TF-IDF and Logistic Regression."
-    ),
-    version="3.0.0",
+    description="Classify text as human-written or AI-generated",
+    version="1.0.0"
 )
 
+# Enable CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -77,19 +56,41 @@ app.add_middleware(
 )
 
 
-# --------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Pydantic models
-# --------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 class TextInput(BaseModel):
-    text: str = Field(
-        ...,
-        min_length=1,
-        description="Text to classify",
+    """Request model for text classification"""
+    text: str = Field(..., min_length=1, description="Text to classify")
+    example: Optional[str] = Field(
+        None, description="Example text for testing"
     )
 
 
+class PredictionResult(BaseModel):
+    """Response model for classification result"""
+    input_text: str
+    prediction: str
+    confidence: Optional[float] = None
+    features_extracted: Optional[int] = None
+    model_used: str = "ai_vs_human_model_LR50k.pkl"
+
+
+class HealthResponse(BaseModel):
+    """Health check response"""
+    status: str
+    model_loaded: bool
+    model_path: str
+
+
+class PredictRequest(BaseModel):
+    """Request model for the /predict endpoint used by the TextGuard frontend"""
+    text: str = Field(..., min_length=1, description="Text to classify")
+
+
 class PredictResponse(BaseModel):
+    """Response model matching the TextGuard frontend's expected contract"""
     prediction: int
     label: str
     ai_probability: float
@@ -98,383 +99,179 @@ class PredictResponse(BaseModel):
     features: dict
 
 
-class PredictionResult(BaseModel):
-    input_text: str
-    prediction: str
-    confidence: Optional[float] = None
-    features_extracted: int
-    model_used: str = "ai_vs_human_model_LR50k.pkl"
+def _confidence_bucket(max_probability: float) -> str:
+    """Map a top-class probability to a coarse confidence label"""
+    if max_probability >= 0.85:
+        return "High"
+    if max_probability >= 0.65:
+        return "Medium"
+    return "Low"
 
 
-class HealthResponse(BaseModel):
-    status: str
-    model_loaded: bool
-    model_path: str
-
-
-# --------------------------------------------------------------------------
-# Global model
-# --------------------------------------------------------------------------
-
-_model: Optional[Any] = None
-
-
-# --------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Model loading
-# --------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+
+_model = None
+_model_path = None
+
 
 def load_model():
-    """
-    Load the TF-IDF + Logistic Regression model once.
-
-    The pickle can contain either:
-
-        1. A complete sklearn Pipeline
-
-    or:
-
-        2. A dictionary containing vectorizer + classifier
-
-    or:
-
-        3. A classifier that already expects TF-IDF vectors.
-    """
-
-    global _model
+    """Load the pre-trained sklearn Pipeline from pickle file"""
+    global _model, _model_path
 
     if _model is not None:
         return _model
 
-    if not MODEL_PATH.exists():
+    current_dir = Path(__file__).parent
+    model_path = current_dir / "ai_vs_human_model_LR50k.pkl"
+
+    if not model_path.exists():
         raise FileNotFoundError(
-            f"Model file not found: {MODEL_PATH}"
+            f"Model file not found at {model_path}. "
+            "Please ensure ai_vs_human_model_LR50k.pkl is in the project directory."
         )
 
     try:
-        with open(MODEL_PATH, "rb") as f:
-            _model = pickle.load(f)
-
-        print(f"Model loaded: {MODEL_PATH}")
-        print(f"Model type: {type(_model)}")
-
+        with open(model_path, "rb") as f:
+            _model = joblib.load(f)
+            _model_path = str(model_path)
+        print(f"Model loaded successfully from {model_path}")
         return _model
-
     except Exception as e:
+        # Most likely cause: scikit-learn version mismatch between the
+        # environment the model was pickled in and this one.
         raise RuntimeError(
-            f"Failed to load {MODEL_PATH}: {e}"
+            f"Failed to load model: {str(e)}. "
+            "If this is an UnpicklingError, check that the deployed "
+            "scikit-learn version matches the one used to train/save the model."
         )
 
 
 def get_model():
-    return _model if _model is not None else load_model()
+    """Get the loaded model, loading it if necessary"""
+    if _model is None:
+        load_model()
+    return _model
 
 
-# --------------------------------------------------------------------------
-# Prediction
-# --------------------------------------------------------------------------
-
-def predict_text(text: str, model=None):
+def _predict_with_model(model, text: str):
     """
-    Run TF-IDF + Logistic Regression prediction.
+    Run the model on the raw input text.
 
-    Supports:
-        sklearn Pipeline
-        vectorizer/classifier dictionary
-        classifier with pre-vectorized input
+    The model is a Pipeline(TfidfVectorizer/TfidfTransformer, LogisticRegression)
+    that takes text only -- NOT the engineered features DataFrame (that's for the
+    frontend display only). Crucially, it must be called with a LIST of documents
+    (`[text]`), not the bare string `text` itself -- passing a raw string to a
+    fitted TfidfVectorizer's `.transform()` iterates over its characters instead
+    of treating it as one document, which silently returns nonsense instead of
+    raising an error.
     """
+    prediction = int(model.predict([text])[0])
 
-    if model is None:
-        model = get_model()
-
-    # --------------------------------------------------------------
-    # Case 1:
-    # Complete sklearn Pipeline
-    # --------------------------------------------------------------
-
-    if hasattr(model, "predict_proba") and hasattr(model, "predict"):
-
-        # Pipeline can directly accept raw text.
-        try:
-            prediction_raw = model.predict([text])
-            probabilities = model.predict_proba([text])
-
-            prediction = int(prediction_raw[0])
-
-            probabilities = np.asarray(probabilities)[0]
-
-            # Find probability belonging to class 1.
-            if hasattr(model, "classes_"):
-                classes = list(model.classes_)
-
-                if AI_CLASS in classes:
-                    ai_index = classes.index(AI_CLASS)
-                    ai_probability = float(probabilities[ai_index])
-                else:
-                    ai_probability = float(probabilities[-1])
-            else:
-                ai_probability = float(probabilities[-1])
-
-            human_probability = 1.0 - ai_probability
-
-            label = (
-                "AI"
-                if prediction == AI_CLASS
-                else "Human"
-            )
-
-            return (
-                prediction,
-                label,
-                ai_probability,
-                human_probability,
-            )
-
-        except Exception:
-            pass
-
-    # --------------------------------------------------------------
-    # Case 2:
-    # Dictionary containing vectorizer + classifier
-    # --------------------------------------------------------------
-
-    if isinstance(model, dict):
-
-        vectorizer = (
-            model.get("vectorizer")
-            or model.get("tfidf")
-            or model.get("tfidf_vectorizer")
-        )
-
-        classifier = (
-            model.get("model")
-            or model.get("classifier")
-            or model.get("lr")
-            or model.get("logistic_regression")
-        )
-
-        if vectorizer is None or classifier is None:
-            raise RuntimeError(
-                "Dictionary model does not contain a recognizable "
-                "TF-IDF vectorizer and classifier."
-            )
-
-        X = vectorizer.transform([text])
-
-        prediction = int(classifier.predict(X)[0])
-
-        probabilities = classifier.predict_proba(X)[0]
-
-        if hasattr(classifier, "classes_"):
-            classes = list(classifier.classes_)
-
-            if AI_CLASS in classes:
-                ai_index = classes.index(AI_CLASS)
-                ai_probability = float(probabilities[ai_index])
-            else:
-                ai_probability = float(probabilities[-1])
-        else:
-            ai_probability = float(probabilities[-1])
-
+    try:
+        probabilities = model.predict_proba([text])[0]
+        human_probability = float(probabilities[0])
+        ai_probability = float(probabilities[1])
+    except (AttributeError, IndexError):
+        ai_probability = 1.0 if prediction == 1 else 0.0
         human_probability = 1.0 - ai_probability
 
-        label = (
-            "AI"
-            if prediction == AI_CLASS
-            else "Human"
-        )
+    return prediction, human_probability, ai_probability
 
-        return (
-            prediction,
-            label,
-            ai_probability,
-            human_probability,
-        )
-
-    raise RuntimeError(
-        "Unsupported model format. The pickle must contain either "
-        "an sklearn Pipeline or a vectorizer/classifier pair."
-    )
-
-
-# --------------------------------------------------------------------------
-# Confidence
-# --------------------------------------------------------------------------
-
-def confidence_bucket(max_probability: float) -> str:
-
-    if max_probability >= 0.85:
-        return "High"
-
-    if max_probability >= 0.65:
-        return "Medium"
-
-    return "Low"
-
-
-# --------------------------------------------------------------------------
-# JSON conversion
-# --------------------------------------------------------------------------
-
-def json_safe(value):
-
-    if isinstance(value, np.integer):
-        return int(value)
-
-    if isinstance(value, np.floating):
-        return float(value)
-
-    if isinstance(value, np.bool_):
-        return bool(value)
-
-    if pd.isna(value):
-        return None
-
-    return value
-
-
-# --------------------------------------------------------------------------
-# Frontend features
-# --------------------------------------------------------------------------
-
-def get_frontend_features(text: str) -> dict:
-    """
-    Extract deterministic text features for frontend display.
-
-    IMPORTANT:
-
-    These features are NOT used by the Logistic Regression model
-    unless your original training pipeline explicitly used them.
-    """
-
-    features_df = extract_text_features(text)
-
-    if features_df.empty:
-        return {}
-
-    features = features_df.iloc[0].to_dict()
-
-    features.pop("Raw_Text", None)
-
-    return {
-        str(k): json_safe(v)
-        for k, v in features.items()
-    }
-
-
-# --------------------------------------------------------------------------
-# High-level classification
-# --------------------------------------------------------------------------
-
-def classify_text(
-    text: str,
-    model=None,
-):
-
-    (
-        prediction,
-        label,
-        ai_probability,
-        human_probability,
-    ) = predict_text(
-        text,
-        model=model,
-    )
-
-    features = get_frontend_features(text)
-
-    return {
-        "text": text,
-        "prediction": prediction,
-        "label": label,
-        "ai_probability": ai_probability,
-        "human_probability": human_probability,
-        "confidence": max(
-            ai_probability,
-            human_probability,
-        ),
-        "features": features,
-    }
-
-
-# --------------------------------------------------------------------------
-# Startup
-# --------------------------------------------------------------------------
 
 @app.on_event("startup")
 async def startup_event():
-
+    """Load model on application startup"""
     try:
         load_model()
-
     except Exception as e:
-        print(
-            f"Warning: model loading failed: {e}"
-        )
+        print(f"Warning: Could not load model on startup: {e}")
 
 
-# --------------------------------------------------------------------------
-# Health
-# --------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
 
-@app.get(
-    "/health",
-    response_model=HealthResponse,
-)
+@app.get("/health", response_model=HealthResponse)
 async def health_check():
-
-    model_loaded = False
-
+    """Health check endpoint"""
     try:
-        load_model()
-        model_loaded = True
-
+        model = get_model()
+        model_loaded = model is not None
     except Exception:
-        pass
+        model_loaded = False
 
     return HealthResponse(
-        status=(
-            "healthy"
-            if model_loaded
-            else "model_not_loaded"
-        ),
+        status="healthy" if model_loaded else "model_not_loaded",
         model_loaded=model_loaded,
-        model_path=str(MODEL_PATH),
+        model_path=_model_path or "not_loaded"
     )
 
 
-# --------------------------------------------------------------------------
-# Main prediction endpoint
-# --------------------------------------------------------------------------
+@app.post("/classify", response_model=PredictionResult)
+async def classify_text(input_data: TextInput):
+    """
+    Classify text as human-written or AI-generated
 
-@app.post(
-    "/predict",
-    response_model=PredictResponse,
-)
-async def predict_text_endpoint(
-    input_data: TextInput,
-):
+    Parameters:
+    - text: The text to classify
 
+    Returns:
+    - Prediction result with confidence score
+    """
     try:
+        features_df = extract_text_features(
+            input_data.text)  # for feature count only
+        model = get_model()
 
-        (
-            prediction,
-            label,
-            ai_probability,
-            human_probability,
-        ) = predict_text(
-            input_data.text
+        prediction, human_probability, ai_probability = _predict_with_model(
+            model, input_data.text
+        )
+        confidence = max(human_probability, ai_probability)
+
+        label_map = {0: "Human", 1: "AI"}
+        predicted_label = label_map.get(prediction, str(prediction))
+
+        return PredictionResult(
+            input_text=input_data.text[:200] + "..."
+            if len(input_data.text) > 200 else input_data.text,
+            prediction=predicted_label,
+            confidence=confidence,
+            features_extracted=len(features_df.columns),
+            model_used="ai_vs_human_model_LR50k.pkl"
         )
 
-        features = get_frontend_features(
-            input_data.text
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Classification error: {str(e)}")
+
+
+@app.post("/predict", response_model=PredictResponse)
+async def predict_text(input_data: PredictRequest):
+    """
+    Classify text and return AI/human probabilities plus the deterministic
+    text features, in the shape expected by the TextGuard frontend.
+    """
+    try:
+        features_df = extract_text_features(
+            input_data.text)  # frontend display only
+        model = get_model()
+
+        prediction, human_probability, ai_probability = _predict_with_model(
+            model, input_data.text
         )
 
-        confidence = confidence_bucket(
-            max(
-                ai_probability,
-                human_probability,
-            )
-        )
+        confidence = _confidence_bucket(max(ai_probability, human_probability))
+        label_map = {0: "Human", 1: "AI"}
+        label = label_map.get(prediction, str(prediction))
+
+        # Raw_Text (if present) is dropped -- the frontend only needs the
+        # numeric/deterministic display features, not the raw string back.
+        features = features_df.to_dict(orient="records")[0]
+        features.pop("Raw_Text", None)
 
         return PredictResponse(
             prediction=prediction,
@@ -486,234 +283,52 @@ async def predict_text_endpoint(
         )
 
     except FileNotFoundError as e:
-
-        raise HTTPException(
-            status_code=503,
-            detail=str(e),
-        )
-
+        raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
-
         raise HTTPException(
-            status_code=500,
-            detail=f"Prediction error: {e}",
-        )
+            status_code=500, detail=f"Prediction error: {str(e)}")
 
-
-# --------------------------------------------------------------------------
-# Backward-compatible endpoint
-# --------------------------------------------------------------------------
-
-@app.post(
-    "/classify",
-    response_model=PredictionResult,
-)
-async def classify_text_endpoint(
-    input_data: TextInput,
-):
-
-    try:
-
-        (
-            prediction,
-            label,
-            ai_probability,
-            human_probability,
-        ) = predict_text(
-            input_data.text
-        )
-
-        features = get_frontend_features(
-            input_data.text
-        )
-
-        return PredictionResult(
-            input_text=(
-                input_data.text[:200] + "..."
-                if len(input_data.text) > 200
-                else input_data.text
-            ),
-            prediction=label,
-            confidence=max(
-                ai_probability,
-                human_probability,
-            ),
-            features_extracted=len(features),
-        )
-
-    except FileNotFoundError as e:
-
-        raise HTTPException(
-            status_code=503,
-            detail=str(e),
-        )
-
-    except Exception as e:
-
-        raise HTTPException(
-            status_code=500,
-            detail=f"Classification error: {e}",
-        )
-
-
-# --------------------------------------------------------------------------
-# Features endpoint
-# --------------------------------------------------------------------------
 
 @app.post("/features")
-async def extract_features_endpoint(
-    input_data: TextInput,
-):
+async def extract_features(input_data: TextInput):
+    """
+    Extract features from text without making a prediction
 
+    Useful for debugging and understanding feature extraction
+    """
     try:
-
-        features = get_frontend_features(
-            input_data.text
-        )
-
+        features_df = extract_text_features(input_data.text)
         return {
-            "text": (
-                input_data.text[:200] + "..."
-                if len(input_data.text) > 200
-                else input_data.text
-            ),
-            "features": features,
+            "text": input_data.text[:200] + "..." if len(input_data.text) > 200 else input_data.text,
+            "features": features_df.to_dict(orient="records")[0]
         }
-
     except Exception as e:
-
         raise HTTPException(
-            status_code=500,
-            detail=f"Feature extraction error: {e}",
-        )
+            status_code=500, detail=f"Feature extraction error: {str(e)}")
 
-
-# --------------------------------------------------------------------------
-# Root endpoint
-# --------------------------------------------------------------------------
 
 @app.get("/")
 async def root():
-
+    """Root endpoint with API documentation"""
     return {
         "message": "Human vs AI Text Classification API",
-
-        "model": (
-            "ai_vs_human_model_LR50k.pkl"
-        ),
-
-        "classifier": (
-            "TF-IDF + Logistic Regression"
-        ),
-
         "endpoints": {
-
-            "POST /predict":
-                "Run Logistic Regression prediction "
-                "and return frontend features",
-
-            "POST /classify":
-                "Run prediction with simpler response",
-
-            "POST /features":
-                "Extract frontend features without prediction",
-
-            "GET /health":
-                "Check model loading",
-
-            "GET /docs":
-                "Interactive API documentation",
-        },
+            "POST /predict": "Classify text and return AI/human probabilities (used by the TextGuard frontend)",
+            "POST /classify": "Classify text as human or AI",
+            "POST /features": "Extract features from text",
+            "GET /health": "Health check",
+            "GET /docs": "Interactive API documentation"
+        }
     }
 
 
-# --------------------------------------------------------------------------
-# CLI smoke test
-# --------------------------------------------------------------------------
-
-def run_cli_test():
-
-    model = load_model()
-
-    sample_texts = [
-
-        "I love programming in Python. "
-        "It's fun and powerful.",
-
-        (
-            "The implementation of machine learning "
-            "algorithms requires careful consideration "
-            "of computational complexity and data "
-            "preprocessing strategies to ensure "
-            "optimal model performance."
-        ),
-
-    ]
-
-    print(
-        "Testing TF-IDF + Logistic Regression"
-        "\n" + "=" * 60
-    )
-
-    for text in sample_texts:
-
-        result = classify_text(
-            text,
-            model=model,
-        )
-
-        print(
-            f"\nText: {result['text'][:100]}..."
-        )
-
-        print(
-            f"Prediction: {result['label']}"
-        )
-
-        print(
-            f"AI probability: "
-            f"{result['ai_probability']:.4f}"
-        )
-
-        print(
-            f"Human probability: "
-            f"{result['human_probability']:.4f}"
-        )
-
-        print(
-            f"Confidence: "
-            f"{result['confidence']:.4f}"
-        )
-
-        print(
-            "Frontend features extracted: "
-            f"{len(result['features'])}"
-        )
-
-
-# --------------------------------------------------------------------------
-# Entry point
-# --------------------------------------------------------------------------
-
 if __name__ == "__main__":
+    import uvicorn
 
-    if (
-        len(sys.argv) > 1
-        and sys.argv[1] == "test"
-    ):
-
-        # python app.py test
-        run_cli_test()
-
-    else:
-
-        # python app.py
-        import uvicorn
-
-        uvicorn.run(
-            "app:app",
-            host="0.0.0.0",
-            port=8000,
-            reload=True,
-            log_level="info",
-        )
+    uvicorn.run(
+        "app:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True,
+        log_level="info"
+    )
