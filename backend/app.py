@@ -157,22 +157,29 @@ def get_model():
 
 def _predict_with_model(model, text: str):
     """
-    Run the model on the raw input text.
+    Run the sklearn Pipeline on a single text.
 
-    The model is a Pipeline(TfidfVectorizer/TfidfTransformer, LogisticRegression)
-    that takes text only -- NOT the engineered features DataFrame (that's for the
-    frontend display only). Crucially, it must be called with a LIST of documents
-    (`[text]`), not the bare string `text` itself -- passing a raw string to a
-    fitted TfidfVectorizer's `.transform()` iterates over its characters instead
-    of treating it as one document, which silently returns nonsense instead of
-    raising an error.
+    The fitted pipeline expects a pandas DataFrame containing
+    a column named exactly 'text'.
     """
-    prediction = int(model.predict([text])[0])
+
+    # IMPORTANT: [text] creates a one-row DataFrame
+    textdf = pd.DataFrame({
+        "text": [text]
+    })
+
+    # Pass the DataFrame to the Pipeline
+    prediction = int(model.predict(textdf)[0])
 
     try:
-        probabilities = model.predict_proba([text])[0]
+        probabilities = model.predict_proba(textdf)[0]
+
+        # Assuming:
+        # class 0 = Human
+        # class 1 = AI
         human_probability = float(probabilities[0])
         ai_probability = float(probabilities[1])
+
     except (AttributeError, IndexError):
         ai_probability = 1.0 if prediction == 1 else 0.0
         human_probability = 1.0 - ai_probability
@@ -328,7 +335,7 @@ if __name__ == "__main__":
     uvicorn.run(
         "app:app",
         host="0.0.0.0",
-        port=8000,
+        port=2200,
         reload=True,
         log_level="info"
     )
